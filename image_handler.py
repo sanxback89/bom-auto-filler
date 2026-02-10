@@ -167,6 +167,51 @@ def _find_fitz_image_for_bbox(
 
 
 # ----------------------------
+# MuPDF 렌더링 기반 셀 이미지 추출 (컬러 변환·벡터 등 모두 처리)
+# ----------------------------
+_fitz_doc_cache: Dict[str, object] = {}
+
+
+def _fitz_render_cell(
+    pdf_path: str,
+    page_idx: int,
+    bbox: Tuple[float, float, float, float],
+    dpi: int = 200,
+) -> Optional[bytes]:
+    """
+    MuPDF 엔진으로 셀 영역만 클리핑 렌더링.
+    임베디드 이미지 추출(extract_image)과 달리 PDF의 컬러 변환,
+    벡터 그래픽, Form XObject 등을 모두 정확히 렌더링.
+    MuPDF는 C 라이브러리이므로 Windows/Linux 동일 결과 보장.
+    """
+    if _fitz is None:
+        return None
+    try:
+        if pdf_path not in _fitz_doc_cache:
+            for d in _fitz_doc_cache.values():
+                try:
+                    d.close()
+                except Exception:
+                    pass
+            _fitz_doc_cache.clear()
+            _fitz_doc_cache[pdf_path] = _fitz.open(pdf_path)
+        doc = _fitz_doc_cache[pdf_path]
+        page = doc[page_idx]
+        x0, top, x1, bottom = bbox
+        clip = _fitz.Rect(x0, top, x1, bottom)
+        pix = page.get_pixmap(clip=clip, dpi=dpi)
+        if pix.alpha:
+            img = PILImage.frombytes("RGBA", [pix.width, pix.height], pix.samples)
+        else:
+            img = PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
+# ----------------------------
 # Pixel helpers
 # ----------------------------
 def _col_width_to_pixels(width: Optional[float]) -> int:
@@ -622,7 +667,7 @@ def extract_graphic_color_cell_images_from_pdf(pdf_path: str) -> Dict[Tuple[str,
                         if key in out:
                             continue
                         try:
-                            png_data = _find_fitz_image_for_bbox(pdf_path, page.page_number - 1, bbox)
+                            png_data = _fitz_render_cell(pdf_path, page.page_number - 1, bbox)
                             if png_data:
                                 out[key] = png_data
                                 continue
@@ -635,7 +680,6 @@ def extract_graphic_color_cell_images_from_pdf(pdf_path: str) -> Dict[Tuple[str,
                         except Exception:
                             continue
 
-    _fitz_image_cache.pop((pdf_path, 0), None)  # cleanup hint
     return out
 
 
@@ -710,7 +754,7 @@ def extract_continuation_graphic_images(
 
             try:
                 if pdf_path:
-                    png_data = _find_fitz_image_for_bbox(pdf_path, page.page_number - 1, bbox)
+                    png_data = _fitz_render_cell(pdf_path, page.page_number - 1, bbox)
                     if png_data:
                         out[key] = png_data
                         continue
@@ -840,7 +884,7 @@ def extract_bom_image_map_from_pdf(pdf_path: str) -> Dict[Tuple[str, str, str], 
                     try:
                         has_embedded = _has_embedded_image_in_bbox(page, bbox)
                         if has_embedded:
-                            png_data = _find_fitz_image_for_bbox(pdf_path, page.page_number - 1, bbox)
+                            png_data = _fitz_render_cell(pdf_path, page.page_number - 1, bbox, dpi=250)
                             if png_data:
                                 img_map[key] = png_data
                                 continue
