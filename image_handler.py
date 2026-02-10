@@ -19,6 +19,44 @@ TARGET_BOM_IMAGE_WIDTH_CM = 1.88
 _PX_PER_INCH = 96.0
 _CM_PER_INCH = 2.54
 
+# Full-page render cache (avoids re-rendering the same page for each cell)
+_page_render_cache: Dict = {}
+
+
+def _crop_cell_image(page, bbox, resolution=200):
+    """
+    Full-page render → pixel-level crop.
+    page.crop(bbox).to_image() 방식은 인접 셀의 임베디드 이미지를
+    정확히 분리하지 못하는 버그가 있어, 전체 페이지를 한 번 렌더링 후
+    픽셀 좌표로 크롭하는 방식으로 대체.
+    """
+    global _page_render_cache
+    cache_key = (id(page), resolution)
+
+    if cache_key not in _page_render_cache:
+        _page_render_cache.clear()
+        _page_render_cache[cache_key] = page.to_image(resolution=resolution).original
+
+    full_img = _page_render_cache[cache_key]
+
+    x0, top, x1, bottom = bbox
+    page_w = float(page.width)
+    page_h = float(page.height)
+    img_w, img_h = full_img.size
+
+    scale_x = img_w / page_w
+    scale_y = img_h / page_h
+
+    px_x0 = max(0, int(x0 * scale_x))
+    px_top = max(0, int(top * scale_y))
+    px_x1 = min(img_w, int(x1 * scale_x))
+    px_bottom = min(img_h, int(bottom * scale_y))
+
+    if px_x1 <= px_x0 or px_bottom <= px_top:
+        return None
+
+    return full_img.crop((px_x0, px_top, px_x1, px_bottom))
+
 
 # ----------------------------
 # Pixel helpers
@@ -226,7 +264,9 @@ def extract_design_image_from_pdf(pdf_path: str):
                             min(page.width, x1 + pad),
                             min(page.height, bottom + pad),
                         )
-                        im = page.crop(bbox).to_image(resolution=200).original
+                        im = _crop_cell_image(page, bbox, resolution=200)
+                        if im is None:
+                            raise ValueError("empty crop")
                         im = _trim_pil_to_content(im)
                         return im
             except Exception:
@@ -267,8 +307,9 @@ def extract_design_image_from_pdf(pdf_path: str):
                 bottom = max(top + 10, min(page.height, y_next - 6))
 
             bbox = (0, top, page.width, bottom)
-            cropped = page.crop(bbox)
-            im = cropped.to_image(resolution=200).original
+            im = _crop_cell_image(page, bbox, resolution=200)
+            if im is None:
+                return None
             im = _trim_pil_to_content(im)
             return im
     except Exception:
@@ -473,7 +514,9 @@ def extract_graphic_color_cell_images_from_pdf(pdf_path: str) -> Dict[Tuple[str,
                         if key in out:
                             continue
                         try:
-                            pil = page.crop(bbox).to_image(resolution=200).original
+                            pil = _crop_cell_image(page, bbox, resolution=200)
+                            if pil is None:
+                                continue
                             buf = BytesIO()
                             pil.save(buf, format="PNG")
                             out[key] = buf.getvalue()
@@ -552,8 +595,8 @@ def extract_continuation_graphic_images(
                 continue
 
             try:
-                pil = page.crop(bbox).to_image(resolution=200).original
-                if _is_blank(pil):
+                pil = _crop_cell_image(page, bbox, resolution=200)
+                if pil is None or _is_blank(pil):
                     continue
                 buf = BytesIO()
                 pil.save(buf, format="PNG")
@@ -677,8 +720,9 @@ def extract_bom_image_map_from_pdf(pdf_path: str) -> Dict[Tuple[str, str, str], 
 
                     try:
                         has_embedded = _has_embedded_image_in_bbox(page, bbox)
-                        cropped = page.crop(bbox)
-                        pil = cropped.to_image(resolution=250).original
+                        pil = _crop_cell_image(page, bbox, resolution=250)
+                        if pil is None:
+                            continue
                         if not has_embedded:
                             pil = _trim_pil_to_content(pil)
                         if _is_blank(pil):
