@@ -634,6 +634,7 @@ def extract_bom_rows_from_pdf(pdf_path: str) -> Tuple[List[BomRow], List[str]]:
                         cont_imgs = extract_continuation_graphic_images(
                             page, tbl_obj, row_to_bomrow_map,
                             current_block_rows, header, header_norm,
+                            pdf_path=pdf_path,
                         )
                         for (prod, mat, htxt), png_bytes in cont_imgs.items():
                             for brow in current_block_rows:

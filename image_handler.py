@@ -15,6 +15,13 @@ from openpyxl.drawing.image import Image as OpenPyxlImage
 from utils import clean_text, normalize_header, clean_text_keep_newlines, format_color_header_text
 from models import section_from_cell_text
 
+try:
+    import fitz as _fitz  # PyMuPDF – 렌더링 없이 임베디드 이미지 직접 추출
+except ImportError:
+    _fitz = None
+
+from PIL import Image as PILImage
+
 TARGET_BOM_IMAGE_WIDTH_CM = 1.88
 _PX_PER_INCH = 96.0
 _CM_PER_INCH = 2.54
@@ -56,6 +63,107 @@ def _crop_cell_image(page, bbox, resolution=200):
         return None
 
     return full_img.crop((px_x0, px_top, px_x1, px_bottom))
+
+
+# ----------------------------
+# PyMuPDF 직접 이미지 추출 (플랫폼 독립)
+# ----------------------------
+_fitz_image_cache: Dict[Tuple[str, int], List[Tuple[Tuple[float, float, float, float], bytes]]] = {}
+
+
+def _get_fitz_images_for_page(
+    pdf_path: str, page_idx: int
+) -> List[Tuple[Tuple[float, float, float, float], bytes]]:
+    """
+    PyMuPDF로 페이지의 모든 임베디드 이미지를 추출.
+    렌더링 없이 PDF 내부의 원본 이미지 데이터를 직접 가져오므로
+    OS/백엔드에 무관하게 동일한 결과를 보장.
+    Returns: [((x0, y0, x1, y1), png_bytes), ...]
+    """
+    if _fitz is None:
+        return []
+    cache_key = (pdf_path, page_idx)
+    if cache_key in _fitz_image_cache:
+        return _fitz_image_cache[cache_key]
+
+    results: List[Tuple[Tuple[float, float, float, float], bytes]] = []
+    doc = None
+    try:
+        doc = _fitz.open(pdf_path)
+        page = doc[page_idx]
+        img_list = page.get_images(full=True)
+        processed_xrefs: set = set()
+
+        for img_info in img_list:
+            xref = img_info[0]
+            if xref in processed_xrefs:
+                continue
+            processed_xrefs.add(xref)
+            try:
+                rects = page.get_image_rects(xref)
+                if not rects:
+                    continue
+                base = doc.extract_image(xref)
+                if not base or not base.get("image"):
+                    continue
+                raw = base["image"]
+                pil = PILImage.open(BytesIO(raw))
+                if pil.mode == "CMYK":
+                    pil = pil.convert("RGB")
+                elif pil.mode not in ("RGB", "RGBA", "L"):
+                    pil = pil.convert("RGB")
+                buf = BytesIO()
+                pil.save(buf, format="PNG")
+                png = buf.getvalue()
+                for rect in rects:
+                    if rect.is_empty or rect.is_infinite:
+                        continue
+                    results.append(((rect.x0, rect.y0, rect.x1, rect.y1), png))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    finally:
+        if doc:
+            doc.close()
+
+    _fitz_image_cache[cache_key] = results
+    return results
+
+
+def _find_fitz_image_for_bbox(
+    pdf_path: str,
+    page_idx: int,
+    bbox: Tuple[float, float, float, float],
+    min_overlap: float = 25.0,
+) -> Optional[bytes]:
+    """
+    셀 bbox와 가장 많이 겹치는 임베디드 이미지를 PyMuPDF로 직접 추출.
+    렌더링 기반이 아니므로 Windows/Linux 무관하게 올바른 이미지 반환.
+    """
+    images = _get_fitz_images_for_page(pdf_path, page_idx)
+    if not images:
+        return None
+
+    x0, top, x1, bottom = bbox
+    cell_area = max(1.0, (x1 - x0) * (bottom - top))
+
+    best_score = 0.0
+    best_png: Optional[bytes] = None
+
+    for (ix0, iy0, ix1, iy1), png_bytes in images:
+        ow = max(0.0, min(x1, ix1) - max(x0, ix0))
+        oh = max(0.0, min(bottom, iy1) - max(top, iy0))
+        overlap = ow * oh
+        if overlap < min_overlap:
+            continue
+        img_area = max(1.0, (ix1 - ix0) * (iy1 - iy0))
+        score = overlap / min(cell_area, img_area)
+        if score > best_score:
+            best_score = score
+            best_png = png_bytes
+
+    return best_png
 
 
 # ----------------------------
@@ -514,6 +622,10 @@ def extract_graphic_color_cell_images_from_pdf(pdf_path: str) -> Dict[Tuple[str,
                         if key in out:
                             continue
                         try:
+                            png_data = _find_fitz_image_for_bbox(pdf_path, page.page_number - 1, bbox)
+                            if png_data:
+                                out[key] = png_data
+                                continue
                             pil = _crop_cell_image(page, bbox, resolution=200)
                             if pil is None:
                                 continue
@@ -523,6 +635,7 @@ def extract_graphic_color_cell_images_from_pdf(pdf_path: str) -> Dict[Tuple[str,
                         except Exception:
                             continue
 
+    _fitz_image_cache.pop((pdf_path, 0), None)  # cleanup hint
     return out
 
 
@@ -533,6 +646,7 @@ def extract_continuation_graphic_images(
     current_block_rows: list,
     header: List[str],
     header_norm: List[str],
+    pdf_path: str = "",
 ) -> Dict[Tuple[str, str, str], bytes]:
     """
     continuation í…Œì´ë¸”ì—ì„œ Graphic í–‰ì˜ ì»¬ëŸ¬ ì´ë¯¸ì§€ë¥¼ ì¶”ì¶œ.
@@ -595,6 +709,11 @@ def extract_continuation_graphic_images(
                 continue
 
             try:
+                if pdf_path:
+                    png_data = _find_fitz_image_for_bbox(pdf_path, page.page_number - 1, bbox)
+                    if png_data:
+                        out[key] = png_data
+                        continue
                 pil = _crop_cell_image(page, bbox, resolution=200)
                 if pil is None or _is_blank(pil):
                     continue
@@ -720,6 +839,11 @@ def extract_bom_image_map_from_pdf(pdf_path: str) -> Dict[Tuple[str, str, str], 
 
                     try:
                         has_embedded = _has_embedded_image_in_bbox(page, bbox)
+                        if has_embedded:
+                            png_data = _find_fitz_image_for_bbox(pdf_path, page.page_number - 1, bbox)
+                            if png_data:
+                                img_map[key] = png_data
+                                continue
                         pil = _crop_cell_image(page, bbox, resolution=250)
                         if pil is None:
                             continue
